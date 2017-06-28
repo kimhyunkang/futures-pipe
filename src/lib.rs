@@ -29,10 +29,10 @@ struct Inner {
 
 struct State {
     // Next position to read/write
-    // The MSB of pos stores parity bit. This bit is flipped on and off every time
-    // The value is wrapped around. This helps us distinguish if the buffer is full or empty when
-    // rd_pos and wr_pos are same: the buffer is empty, if the parity bit is the same, and the
-    // is full if the parity bit is not the same
+    // The MSB of pos stores parity bit. This bit is flipped on and off every time the value is
+    // wrapped around. This helps us distinguish if the buffer is full or empty even when
+    // `rd_state.pos` and `wr_state.pos` are same. When rest of the bits are the same, the buffer is
+    // empty if the parity bit is the same, and is full if the parity bit is not the same
     pos: AtomicUsize,
     // Parked task
     task: Mutex<Option<Task>>,
