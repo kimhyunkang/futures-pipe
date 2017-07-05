@@ -4,14 +4,15 @@ version = "0.1.0"
 authors = ["Hyunkang Kim <kimhyunkang@gmail.com>"]
 
 [dependencies]
+bytes = { version = "0.4", optional = true }
 futures = "0.1"
-tokio-io = {version = "0.1", optional = true }
+tokio-io = { version = "0.1", optional = true }
 
 [dev-dependencies]
 rand = "0.3"
 tokio-core = "0.1"
 
 [features]
-default = ["tokio"]
+default = ["use_tokio_io"]
 
-tokio = ["tokio-io"]
+use_tokio_io = ["bytes", "tokio-io"]

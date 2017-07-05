@@ -6,7 +6,7 @@ extern crate tokio_core;
 use std::{cmp, io};
 
 use futures::{Async, Future, Poll};
-use futures_pipe::pipe_with_capacity;
+use futures_pipe::pipe;
 use rand::{StdRng, Rng};
 use tokio_core::reactor::Core;
 
@@ -107,7 +107,7 @@ impl <R, RNG> Future for CumulativeRead<R, RNG>
 #[test]
 fn test() {
     let mut core = Core::new().expect("Failed to initialize reactor");
-    let (writer, reader) = pipe_with_capacity(32);
+    let (writer, reader) = pipe(32);
 
     let mut source = vec![0; 100000];
     let mut rng = StdRng::new().expect("Failed to open RNG");

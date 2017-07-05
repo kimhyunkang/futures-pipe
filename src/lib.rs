@@ -1,5 +1,34 @@
+//! A single-producer, single-consumer, futures-aware byte channel.
+//!
+//! This library provides a byte buffer which works like a UNIX pipe, but intended to work with
+//! [futures](https://docs.rs/futures).
+//!
+//! You can use the pipe to send byte stream between two tasks. If the buffer is empty,
+//! `PipeReader::read` will return `WouldBlock` error and the task will be notified when there is
+//! new data. If the buffer is full, the `PipeWriter::write` will return `WouldBlock` error and the
+//! task will be notified when there is new buffer space available.
+//!
+//! # AsyncRead and AsyncWrite
+//!
+//! `PipeReader` also implements `AsyncReader` and `PipeWriter` implements `AsyncWriter` from
+//! [tokio-io](https://docs.rs/tokio-io) crate. If you don't need this dependency, turn off
+//! `use_tokio_io` feature in your `Cargo.toml` file.
+//!
+//! # Closing the pipe
+//!
+//! When the `PipeReader` is closed or dropped, the `PipeWriter` on the other side will be notified
+//! and the subsequent call to `PipeWriter::write` will return `Ok(0)`, indicating no more data will
+//! be read from the reader. The data written so far, but not read by the reader, will be lost.
+//!
+//! When the `PipeWriter` is closed or dropped, the `PipeReader` on the other side will be notified,
+//! but still can read remaining data in the buffer. When the pipe is closed and the buffer is
+//! empty, the subsequent call to `PipeReader::read` will return `Ok(0)`, indicating there is no
+//! more data to be read.
+
+#[cfg(feature = "use_tokio_io")]
+extern crate bytes;
 extern crate futures;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "use_tokio_io")]
 extern crate tokio_io;
 
 use std::{io, mem, slice};
@@ -8,16 +37,20 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering as MemoryOrdering;
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "use_tokio_io")]
+use bytes::BufMut;
+#[cfg(feature = "use_tokio_io")]
 use futures::{Async, Poll};
 use futures::task::{self, Task};
-#[cfg(feature = "tokio")]
+#[cfg(feature = "use_tokio_io")]
 use tokio_io::{AsyncRead, AsyncWrite};
 
 const SIZE_MASK: usize = ::std::usize::MAX >> 1;
 const PARITY_MASK: usize = ::std::usize::MAX ^ SIZE_MASK;
 
 struct Inner {
+    // Pointer to the original Box<[u8]>. This will be wrapped again into the Box<[u8]> when this
+    // struct is dropped
     buf: *mut [u8],
     capacity: usize,
 
@@ -69,6 +102,33 @@ impl Inner {
             (pos + len - self.capacity) | (PARITY_MASK & !parity)
         }
     }
+
+    fn len(&self) -> usize {
+        let wr_pos = self.wr_state.pos.load(MemoryOrdering::Acquire);
+        let rd_pos = self.rd_state.pos.load(MemoryOrdering::Acquire);
+        let end: usize = wr_pos & SIZE_MASK;
+        let start: usize = rd_pos & SIZE_MASK;
+
+        match start.cmp(&end) {
+            Ordering::Less => end - start,
+            Ordering::Equal => {
+                let wr_parity = wr_pos & PARITY_MASK;
+                let rd_parity = rd_pos & PARITY_MASK;
+                if rd_parity == wr_parity {
+                    0
+                } else {
+                    self.capacity
+                }
+            },
+            Ordering::Greater => self.capacity - start + end
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        let wr_pos = self.wr_state.pos.load(MemoryOrdering::Acquire);
+        let rd_pos = self.rd_state.pos.load(MemoryOrdering::Acquire);
+        wr_pos == rd_pos
+    }
 }
 
 impl Drop for Inner {
@@ -80,7 +140,19 @@ impl Drop for Inner {
     }
 }
 
-pub fn pipe(buf: Box<[u8]>) -> (PipeWriter, PipeReader) {
+/// Create a new pipe with given buffer.
+///
+/// This function creates a pair of writer and reader, which implements `std::io::Write` and
+/// `std::io::Read` respectively. The writer and reader works like a UNIX pipe, communicating with
+/// each other using `capacity`-sized buffer. The pipe is futures-aware, which means they will
+/// return `WouldBlock` error when they cannot continue the function, and the task will be notified
+/// when the operation can be continued.
+///
+/// # Panics
+///
+/// This function panics when the buffer is empty, or the buffer size exceeds 1/2 of maximum of
+/// usize
+pub fn pipe_with_buffer(buf: Box<[u8]>) -> (PipeWriter, PipeReader) {
     let capacity = buf.len();
     if capacity == 0 {
         panic!("buffer is empty");
@@ -104,10 +176,29 @@ pub fn pipe(buf: Box<[u8]>) -> (PipeWriter, PipeReader) {
     (writer, reader)
 }
 
-pub fn pipe_with_capacity(capacity: usize) -> (PipeWriter, PipeReader) {
-    pipe(vec![0; capacity].into())
+/// Create a new pipe with a buffer of given capacity.
+///
+/// This function creates a pair of writer and reader, which implements `std::io::Write` and
+/// `std::io::Read` respectively. The writer and reader works like a UNIX pipe, communicating with
+/// each other using `capacity`-sized buffer. The pipe is futures-aware, which means they will
+/// return `WouldBlock` error when they cannot continue the function, and the task will be notified
+/// when the operation can be continued.
+///
+/// Use `pipe_with_buffer` if you want to provide your own buffer for the pipe.
+///
+/// # Panics
+///
+/// This function panics when `capacity` is 0, or the `capacity` exceeds 1/2 of maximum of usize
+pub fn pipe(capacity: usize) -> (PipeWriter, PipeReader) {
+    pipe_with_buffer(vec![0; capacity].into())
 }
 
+/// The reading end of the pipe
+///
+/// `PipeReader` is returned from `pipe` or `pipe_with_buffer` function.
+///
+/// `PipeReader` implements `tokio_io::AsyncRead` by default. If you don't want dependency to
+/// tokio_io, turn off `use_tokio_io` feature.
 pub struct PipeReader {
     inner: Arc<Inner>
 }
@@ -115,6 +206,26 @@ pub struct PipeReader {
 unsafe impl Send for PipeReader {}
 
 impl PipeReader {
+    /// Read from the pipe and work with the data.
+    ///
+    /// The provided closure will be called with two byte slices which contain, in order, available
+    /// data. The closure must return the number of bytes it processed, or return error.
+    ///
+    /// When the writer on the other end is closed or dropped, and the buffer is empty, this method
+    /// will return `Ok(0)` without calling the provided closure.
+    ///
+    /// # Errors
+    ///
+    /// This method will return `WouldBlock` error when there is no available data right now. When
+    /// this error is returned, and the task calling this function is not finished, the task will be
+    /// notified when the new data is available.
+    ///
+    /// Otherwise, the function will return error when the provided closure returns error.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the number of bytes returned by the provided closure exceeds the
+    /// number of available data.
     pub fn read_nb<F>(&mut self, f: F) -> io::Result<usize>
         where F: FnOnce(&[u8], &[u8]) -> io::Result<usize>
     {
@@ -213,11 +324,28 @@ impl PipeReader {
         }
     }
 
+    /// Returns true if this channel does not have data
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns amount of bytes this channel has
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns max amount of bytes this channel can buffer
     #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
 
+    /// Close this channel
+    ///
+    /// The `PipeWriter` at the other end won't be able to write any more data, and it will be
+    /// unparked if it was parked
     #[inline]
     pub fn close(&mut self) {
         self.inner.closed.store(true, MemoryOrdering::SeqCst);
@@ -252,9 +380,21 @@ impl Drop for PipeReader {
     }
 }
 
-#[cfg(feature = "tokio")]
-impl AsyncRead for PipeReader {}
+#[cfg(feature = "use_tokio_io")]
+impl AsyncRead for PipeReader {
+    #[inline]
+    unsafe fn prepare_uninitialized_buffer(&self, _buf: &mut [u8]) -> bool {
+        // We don't have to zero the buffer because AsyncRead::read does not read from the buffer
+        true
+    }
+}
 
+/// The writing end of the pipe
+///
+/// `PipeWriter` is returned from `pipe` or `pipe_with_buffer` function.
+///
+/// `PipeWriter` implements `tokio_io::AsyncWrite` by default. If you don't want dependency to
+/// tokio_io, turn off `use_tokio_io` feature.
 pub struct PipeWriter {
     inner: Arc<Inner>
 }
@@ -262,6 +402,26 @@ pub struct PipeWriter {
 unsafe impl Send for PipeWriter {}
 
 impl PipeWriter {
+    /// Write to the pipe with data provided by given closure.
+    ///
+    /// The provided closure will be called with two byte slices which contain, in order, available
+    /// buffer. The closure must return the number of bytes it has written, or return error.
+    ///
+    /// When the writer on the other end is closed or dropped, this method will return `Ok(0)`
+    /// without calling the provided closure.
+    ///
+    /// # Errors
+    ///
+    /// This method will return `WouldBlock` error when there is no available buffer space. When
+    /// this error is returned, and the task calling this function is not finished, the task will be
+    /// notified when the buffer is available.
+    ///
+    /// Otherwise, the function will return error when the provided closure returns error.
+    ///
+    /// # Panics
+    ///
+    /// This method will panic if the number of bytes returned by the provided closure exceeds the
+    /// number of available buffer.
     pub fn write_nb<F>(&mut self, f: F) -> io::Result<usize>
         where F: FnOnce(&mut [u8], &mut [u8]) -> io::Result<usize>
     {
@@ -360,11 +520,29 @@ impl PipeWriter {
         }
     }
 
+    /// Returns true if this channel does not have data
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Returns amount of bytes this channel has
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns max amount of byte this channel can buffer
     #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
 
+    /// Close this channel
+    ///
+    /// The `PipeReader` at the other end will be able to read remaining data in the buffer, and
+    /// after that, it will return `Ok(0)` when read. If the reader task was parked, it will be
+    /// unparked
     #[inline]
     pub fn close(&mut self) {
         self.inner.closed.store(true, MemoryOrdering::SeqCst);
@@ -400,7 +578,7 @@ impl io::Write for PipeWriter {
     }
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "use_tokio_io")]
 impl AsyncWrite for PipeWriter {
     #[inline]
     fn shutdown(&mut self) -> Poll<(), io::Error> {
