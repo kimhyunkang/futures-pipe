@@ -25,8 +25,6 @@
 //! empty, the subsequent call to `PipeReader::read` will return `Ok(0)`, indicating there is no
 //! more data to be read.
 
-#[cfg(feature = "use_tokio_io")]
-extern crate bytes;
 extern crate futures;
 #[cfg(feature = "use_tokio_io")]
 extern crate tokio_io;
@@ -37,8 +35,6 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering as MemoryOrdering;
 
-#[cfg(feature = "use_tokio_io")]
-use bytes::BufMut;
 #[cfg(feature = "use_tokio_io")]
 use futures::{Async, Poll};
 use futures::task::{self, Task};
